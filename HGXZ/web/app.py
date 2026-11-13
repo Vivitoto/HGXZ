@@ -137,14 +137,35 @@ def create_app() -> FastAPI:
         return True
 
     @app.post('/api/sync')
-    async def trigger_sync(album_id: int | None = None):
+    async def trigger_sync(album_id: int | None = None,
+                           all_subscribed: bool = False):
+        """手动同步。
+
+        album_id 指定时只下载那一部（挑着下）；
+        all_subscribed=True 时只下载订阅中的专辑；
+        都不给则全量同步（发现 + 下载全部，原行为）。
+        """
         if not _archiver_ref:
             return JSONResponse({'error': 'not ready'}, 503)
         archiver = _archiver_ref[0]
-        if not _start_background('manual-sync',
-                                 lambda: archiver.scan(only_id=album_id)):
+        if not _start_background(
+                'manual-sync',
+                lambda: archiver.scan(only_id=album_id,
+                                      subscribed_only=all_subscribed)):
             return JSONResponse({'error': '同步正在进行中'}, 409)
-        return {'status': 'started', 'album_id': album_id}
+        return {'status': 'started', 'album_id': album_id,
+                'subscribed_only': all_subscribed}
+
+    @app.post('/api/albums/{album_id}/subscribe')
+    async def set_subscribe(album_id: int, subscribed: bool = True):
+        """订阅/取消订阅。订阅中的专辑会被定时任务自动追更下载。"""
+        if not _state_db:
+            return JSONResponse({'error': 'not ready'}, 503)
+        if not _state_db.album_row(album_id):
+            return JSONResponse({'error': 'not found'}, 404)
+        _state_db.set_subscribed(album_id, subscribed)
+        LOG.info('album=%s subscribed=%s', album_id, subscribed)
+        return {'album_id': album_id, 'subscribed': bool(subscribed)}
 
     @app.post('/api/retry-failed')
     async def retry_failed(album_id: int | None = None):

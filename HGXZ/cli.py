@@ -277,7 +277,14 @@ class Archiver:
         return result
 
     def scan(self, *, metadata_only=False, only_id=None,
-             max_albums=None, max_episodes=None):
+             max_albums=None, max_episodes=None, subscribed_only=False):
+        """扫描并同步。
+
+        metadata_only=True  只发现：抓详情写库、生成 NFO/封面，不下载视频。
+        only_id=<id>        只处理这一部（手动挑着下）。
+        subscribed_only=True 只下载已订阅的专辑（定时追更），未订阅的仍会更新元数据
+                             但不下视频。
+        """
         force = bool(only_id)
         if only_id:
             found = [(only_id, self.config['site']['categories'][0])]
@@ -292,9 +299,14 @@ class Archiver:
             if not force and self._complete_and_fresh(album_id):
                 skipped_complete += 1
                 continue
+            # 只有订阅中的专辑才自动下载；其余仅更新元数据（发现新剧）。
+            # 手动指定 only_id 时一律下载——那是用户明确点了「下载」。
+            ep_meta_only = metadata_only
+            if not force and subscribed_only and not self.state.is_subscribed(album_id):
+                ep_meta_only = True
             try:
                 result = self.sync_album(
-                    album_id, category, metadata_only=metadata_only,
+                    album_id, category, metadata_only=ep_meta_only,
                     max_episodes=max_episodes, force=force)
                 results.append(result)
                 if result.get('failed_episodes'):
@@ -354,7 +366,9 @@ def run_daemon(config: dict, schedule: str, web_port: int = 8099) -> int:
                 LOG.warning('scheduled sync skipped: another sync is already running')
             else:
                 try:
-                    archiver.scan()
+                    # 定时任务只下载订阅中的专辑，未订阅的仅更新元数据，
+                    # 这样每天都能发现新剧而不会把硬盘塞满。
+                    archiver.scan(subscribed_only=True)
                     mark_sync_finished()
                 except Exception as exc:
                     _sync_status['last_error'] = str(exc)
@@ -386,6 +400,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog='HGXZ', description='黄果下载')
     parser.add_argument('--config', default='/config/config.json')
     parser.add_argument('--metadata-only', action='store_true')
+    parser.add_argument('--download-all', action='store_true',
+                        help='全量下载所有专辑（默认只发现新剧，不下载）')
     parser.add_argument('--only-id', type=int)
     parser.add_argument('--max-albums', type=int)
     parser.add_argument('--max-episodes', type=int)
@@ -442,8 +458,11 @@ def main() -> int:
 
     archiver = Archiver(config)
     try:
+        # 首次/手动全量扫描默认只发现不入库下载，除非显式 --download-all。
+        # 单部用 --only-id，订阅的交给定时任务。
         results, failures = archiver.scan(
-            metadata_only=args.metadata_only, only_id=args.only_id,
+            metadata_only=args.metadata_only or not args.download_all,
+            only_id=args.only_id,
             max_albums=args.max_albums, max_episodes=args.max_episodes)
     finally:
         archiver.close()

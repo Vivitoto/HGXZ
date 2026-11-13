@@ -45,10 +45,35 @@ class StateDB:
         if 'directory' not in cols:
             self.conn.execute("ALTER TABLE albums ADD COLUMN directory TEXT NOT NULL DEFAULT ''")
             self.conn.commit()
+        # subscribed: 1 = 订阅中（定时任务自动追更下载），0 = 仅发现（手动挑着下）
+        if 'subscribed' not in cols:
+            self.conn.execute(
+                "ALTER TABLE albums ADD COLUMN subscribed INTEGER NOT NULL DEFAULT 0")
+            self.conn.commit()
         ep_cols = {row[1] for row in self.conn.execute('PRAGMA table_info(episodes)')}
         if 'size_bytes' not in ep_cols:
             self.conn.execute('ALTER TABLE episodes ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0')
             self.conn.commit()
+
+    def set_subscribed(self, album_id: int, subscribed: bool) -> None:
+        with self._lock:
+            self.conn.execute(
+                'UPDATE albums SET subscribed=? WHERE id=?',
+                (1 if subscribed else 0, int(album_id)))
+            self.conn.commit()
+
+    def subscribed_albums(self) -> list[dict]:
+        """所有处于订阅状态的专辑，供定时任务决定要追更哪些。"""
+        with self._lock:
+            rows = self.conn.execute(
+                'SELECT * FROM albums WHERE subscribed=1 ORDER BY id').fetchall()
+        return [dict(row) for row in rows]
+
+    def is_subscribed(self, album_id: int) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                'SELECT subscribed FROM albums WHERE id=?', (int(album_id),)).fetchone()
+        return bool(row and row['subscribed'])
 
     @staticmethod
     def _now() -> str:
@@ -150,6 +175,12 @@ class StateDB:
                       ' AND a.episode_count > 0')
         elif status == 'failed':
             query += ' AND COALESCE(e.failed_count, 0) > 0'
+        elif status == 'subscribed':
+            query += ' AND a.subscribed = 1'
+        elif status == 'new':
+            # 已发现但一集都没下过，用于「挑着下」
+            query += (' AND COALESCE(e.done_count, 0) = 0'
+                      ' AND a.subscribed = 0')
         elif status == 'downloading':
             query += ' AND (a.ended = 0 OR COALESCE(e.done_count, 0) < a.episode_count)'
         query += ' ORDER BY a.last_checked_at DESC'
