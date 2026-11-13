@@ -11,6 +11,7 @@ concurrency:
 
 env:
   DOCKER_BUILD_SUMMARY: false
+  REGISTRY: ghcr.io
 
 jobs:
   build-and-push:
@@ -36,7 +37,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/wx2cyj/hgxz
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/hgxz
           tags: |
             type=raw,value=latest
 

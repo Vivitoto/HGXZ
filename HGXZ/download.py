@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, ProxyHandler, urlopen
+from urllib.request import getproxies as url_getproxies
 import json
 import logging
 import os
@@ -15,7 +17,25 @@ import time
 LOG = logging.getLogger(__name__)
 
 _HEADERS_UA = 'Mozilla/5.0'
-_SEGMENT_ATTEMPTS = 3
+_SEGMENT_ATTEMPTS = 8
+
+# 与 site.py 同理：显式按环境代理构造 opener。
+# 注意必须惰性构造——模块级一次性构造会锁死导入时的环境，测试里改环境变量就失效了。
+_opener = None
+
+
+def _get_opener():
+    global _opener
+    if _opener is None:
+        proxies = url_getproxies() or {}
+        _opener = build_opener(ProxyHandler(proxies)) if proxies else build_opener()
+    return _opener
+
+
+def reset_opener():
+    """环境代理变化后重建 opener（测试/切换网络用）。"""
+    global _opener
+    _opener = None
 
 
 def probe_media(path: Path) -> dict:
@@ -39,10 +59,27 @@ def validate_media(info: dict, minimum_duration: float = 3.0) -> bool:
     return bool(info.get('duration', 0) >= minimum_duration and info.get('video', 0) >= 1)
 
 
-def _fetch(url: str, referer: str, timeout: float) -> bytes:
-    req = Request(url, headers={'User-Agent': _HEADERS_UA, 'Referer': referer})
-    with urlopen(req, timeout=timeout) as response:
-        return response.read()
+def _fetch(url: str, referer: str, timeout: float,
+           extra_headers: dict[str, str] | None = None) -> bytes:
+    headers = {'User-Agent': _HEADERS_UA, 'Referer': referer}
+    # CDN 对清单/密钥/分片单独鉴权：少了 x-cdn-app 会 403，少了 auth 头会直接断 TLS。
+    headers.update(extra_headers or {})
+    # CDN 边缘节点会零星断开 TLS，单发一次很容易失败，这里统一重试。
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            req = Request(url, headers=headers)
+            with _get_opener().open(req, timeout=timeout) as response:
+                return response.read()
+        except HTTPError:
+            raise
+        except (URLError, TimeoutError, ConnectionError, OSError) as error:
+            last_error = error
+            if attempt < 3:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise
+    raise last_error or RuntimeError('media fetch failed')
 
 
 def _attrs(line: str) -> dict:
@@ -89,11 +126,12 @@ def _parse_m3u8(text: str, playlist_url: str) -> dict:
     return {'segments': segments}
 
 
-def _resolve_media_playlist(url: str, referer: str, timeout: float) -> tuple[str, str]:
+def _resolve_media_playlist(url: str, referer: str, timeout: float,
+                            extra_headers: dict[str, str] | None = None) -> tuple[str, str]:
     """Follow master playlists (multiple variants) down to a media playlist."""
     playlist_url = url
     for _ in range(3):
-        text = _fetch(playlist_url, referer, timeout).decode('utf-8', errors='replace')
+        text = _fetch(playlist_url, referer, timeout, extra_headers).decode('utf-8', errors='replace')
         if '#EXT-X-STREAM-INF' not in text:
             return playlist_url, text
         lines = text.splitlines()
@@ -132,7 +170,9 @@ def _decrypt_segment(data: bytes, key: bytes, iv: bytes) -> bytes:
     return plain
 
 
-def download_hls(url: str, destination: Path, referer: str, minimum_duration: float = 3.0, timeout: float | None = 1800.0) -> dict:
+def download_hls(url: str, destination: Path, referer: str, minimum_duration: float = 3.0,
+                 timeout: float | None = 1800.0,
+                 cdn_headers: dict[str, str] | None = None) -> dict:
     # Fetch every HLS segment as its own short-lived request with retries
     # instead of one long ffmpeg stream: the CDN resets long connections
     # mid-transfer, but a few megabytes per request survive that fine.
@@ -142,7 +182,8 @@ def download_hls(url: str, destination: Path, referer: str, minimum_duration: fl
     deadline = None if timeout is None else time.monotonic() + timeout
     fetch_timeout = 30.0
     try:
-        playlist_url, playlist_text = _resolve_media_playlist(url, referer, fetch_timeout)
+        playlist_url, playlist_text = _resolve_media_playlist(
+            url, referer, fetch_timeout, cdn_headers)
         parsed = _parse_m3u8(playlist_text, playlist_url)
         segments = parsed['segments']
         if not segments:
@@ -159,7 +200,8 @@ def download_hls(url: str, destination: Path, referer: str, minimum_duration: fl
                         raise TimeoutError(f'HLS download exceeded {timeout}s')
                     key_uri = segment['key_uri']
                     if key_uri and key_uri not in keys:
-                        keys[key_uri] = _fetch(key_uri, playlist_referer, fetch_timeout)
+                        keys[key_uri] = _fetch(key_uri, playlist_referer, fetch_timeout,
+                                               cdn_headers)
                     data = None
                     last_error: Exception | None = None
                     for attempt in range(1, _SEGMENT_ATTEMPTS + 1):
@@ -168,7 +210,8 @@ def download_hls(url: str, destination: Path, referer: str, minimum_duration: fl
                             raise TimeoutError(f'HLS download exceeded {timeout}s')
                         try:
                             data = _fetch(segment['url'], playlist_referer,
-                                          fetch_timeout if remaining is None else min(fetch_timeout, remaining))
+                                          fetch_timeout if remaining is None else min(fetch_timeout, remaining),
+                                          cdn_headers)
                             if key_uri:
                                 data = _decrypt_segment(data, keys[key_uri], segment['iv'])
                             break

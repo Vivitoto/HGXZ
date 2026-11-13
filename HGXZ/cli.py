@@ -231,9 +231,10 @@ class Archiver:
             succeeded = False
             for attempt in range(1, self.retries + 1):
                 try:
-                    url = self.client.play_url(album.id, number)
+                    url, cdn_headers = self.client.play_url(album.id, number)
                     info = download_hls(url, video, self.client.base_url + '/',
-                                        self.minimum_duration, timeout=self.episode_timeout)
+                                        self.minimum_duration, timeout=self.episode_timeout,
+                                        cdn_headers=cdn_headers)
                     self.state.mark_episode(album.id, number, str(video), 'done',
                                             info.get('size', 0))
                     done += 1
